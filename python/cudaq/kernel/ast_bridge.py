@@ -432,6 +432,54 @@ class PyASTBridge(ast.NodeVisitor):
         self.isSubscriptRoot = False
         self.verbose = verbose
         self.currentNode = None
+        # `for` loop targets that are used nowhere outside their loop, keyed on
+        # `id(<ast.For node>)`
+        self.loopLocalTargets = {}
+        self.sinkAllocaNames = set()
+
+    def __analyzeLoopLocalTargets(self, statements, argNames):
+        """Record, for each `for` loop in `statements`, which of its target
+        variables never occur outside that loop.
+
+        Python keeps a loop variable alive after its loop, so by default the
+        storage for one is allocated in the function's entry block. That is
+        needed only when something below the loop can still read it; a variable
+        that no code outside the loop mentions can live in the loop body
+        instead. Keeping it there matters because `memtoreg` promotes an
+        entry-block slot into a value carried by every enclosing loop, whether
+        or not anything reads it, and those dead loop-carried values defeat
+        `cc.loop` reversal in the apply-op-specialization pass.
+        """
+        forNodes = [
+            n for stmt in statements for n in ast.walk(stmt)
+            if isinstance(n, ast.For)
+        ]
+        if not forNodes:
+            return
+        allNames = [
+            n for stmt in statements for n in ast.walk(stmt)
+            if isinstance(n, ast.Name)
+        ]
+        for forNode in forNodes:
+            if forNode.orelse:
+                continue
+            targets = {
+                t.id
+                for t in ast.walk(forNode.target)
+                if isinstance(t, ast.Name)
+            }
+            targets -= set(argNames)
+            if not targets:
+                continue
+            insideLoop = {id(n) for n in ast.walk(forNode)}
+            usedOutside = {
+                n.id
+                for n in allNames
+                if n.id in targets and id(n) not in insideLoop
+            }
+            local = targets - usedOutside
+            if local:
+                self.loopLocalTargets[id(forNode)] = local
 
     def isCudaqName(self, name):
         """Return True if `name` is 'cudaq' or a known alias for the cudaq
@@ -862,6 +910,23 @@ class PyASTBridge(ast.NodeVisitor):
         """Return True if the current insertion point is within an if statement
         then or else block."""
         return self.inIfStmtBlockStack > 0
+
+    def buildScopedBlock(self, stmts):
+        """Emit `stmts` inside a `cc.scope`.
+
+        A qubit allocated in a compound statement must be freed when that
+        statement ends. `cc.scope` marks that point and `add-deallocs` puts the
+        `quake.dealloc` there. Scopes with nothing to free are removed by
+        canonicalization, so this costs nothing when there is no allocation.
+        """
+        scope = cc.ScopeOp([])
+        scopeBlock = Block.create_at_start(scope.initRegion, [])
+        with InsertionPoint(scopeBlock):
+            self.symbolTable.beginBlock()
+            [self.visit(b) for b in stmts]
+            if not self.hasTerminator(scopeBlock):
+                cc.ContinueOp([])
+            self.symbolTable.endBlock()
 
     def hasTerminator(self, block):
         """Return True if the given Block has a Terminator operation."""
@@ -2050,6 +2115,8 @@ class PyASTBridge(ast.NodeVisitor):
                 # errors on assignments that may lead to unexpected behavior
                 # (i.e. behavior not following expected Python behavior).
                 self.buildingFunctionBody = True
+                self.__analyzeLoopLocalTargets(
+                    node.body, [arg.arg for arg in node.args.args])
                 with trace.span("ast_bridge.visit_function_body",
                                 statement_count=len(node.body)):
                     for n in node.body:
@@ -2415,7 +2482,12 @@ class PyASTBridge(ast.NodeVisitor):
                 if storeAsVal or cc.PointerType.isinstance(value.type):
                     return target, value
 
-                with InsertionPoint.at_block_begin(self.symbolTable.scopeRoot):
+                # A variable that outlives the block it is assigned in needs
+                # its storage in the function's entry block.
+                allocaBlock = (InsertionPoint.current.block
+                               if target.id in self.sinkAllocaNames else
+                               self.symbolTable.scopeRoot)
+                with InsertionPoint.at_block_begin(allocaBlock):
                     address = cc.AllocaOp(cc.PointerType.get(value.type),
                                           TypeAttr.get(value.type)).result
                 cc.StoreOp(value, address)
@@ -4371,23 +4443,63 @@ class PyASTBridge(ast.NodeVisitor):
         if_clauses = node.generators[0].ifs
         hasFilter = len(if_clauses) > 0
 
-        self.visit(node.generators[0].iter)
-        iterable = self.popValue()
-        orig_iterable_type = iterable.type
-        if cc.SequenceType.isinstance(iterable.type):
-            iterableSize = cc.SequenceSizeOp(self.getIntegerType(),
-                                             iterable).result
-            iterTy = cc.SequenceType.getElementType(iterable.type)
-            iterArrPtrTy = cc.PointerType.get(cc.ArrayType.get(iterTy))
-            iterable = cc.SequenceDataOp(iterArrPtrTy, iterable).result
-        elif quake.VeqType.isinstance(iterable.type):
-            iterableSize = quake.VeqSizeOp(self.getIntegerType(),
-                                           iterable).result
-            iterTy = quake.RefType.get()
+        i64Ty = self.getIntegerType()
+
+        # `range(...)` never needs to be materialized into a buffer: the loop
+        # induction variable *is* the element, so there is nothing to
+        # allocate or populate.
+        is_range_source = (isinstance(node.generators[0].iter, ast.Call) and
+                           isinstance(node.generators[0].iter.func, ast.Name)
+                           and node.generators[0].iter.func.id == 'range')
+        if is_range_source:
+            startVal, endVal, stepVal, isDecrementing = \
+                self.__processRangeLoopIterationBounds(
+                    node.generators[0].iter.args)
+            zero = self.getConstantInt(0)
+            one = self.getConstantInt(1)
+            totalSize = arith.SubIOp(endVal, startVal).result
+            roundingOffset = (arith.AddIOp(
+                stepVal, one).result if isDecrementing else arith.SubIOp(
+                    stepVal, one).result)
+            totalSize = arith.AddIOp(totalSize, roundingOffset).result
+            iterableSize = arith.MaxSIOp(
+                zero,
+                arith.DivSIOp(totalSize, stepVal).result).result
+            iterTy = i64Ty
+
+            def extractElem(i):
+                # `i` is a 0-based iteration count (needed for buffer
+                # indexing elsewhere), not the range value itself -- map it
+                # back to the real `range(start, end, step)` value.
+                return arith.AddIOp(startVal,
+                                    arith.MulIOp(i, stepVal).result).result
         else:
-            self.emitFatalError(
-                "CUDA-Q only supports list comprehension on ranges and arrays",
-                node)
+            self.visit(node.generators[0].iter)
+            iterable = self.popValue()
+            orig_iterable_type = iterable.type
+            if cc.SequenceType.isinstance(iterable.type):
+                iterableSize = cc.SequenceSizeOp(i64Ty, iterable).result
+                iterTy = cc.SequenceType.getElementType(iterable.type)
+                iterArrPtrTy = cc.PointerType.get(cc.ArrayType.get(iterTy))
+                iterable = cc.SequenceDataOp(iterArrPtrTy, iterable).result
+
+                def extractElem(i):
+                    elem_addr = cc.ComputePtrOp(
+                        cc.PointerType.get(iterTy), iterable, [i],
+                        DenseI32ArrayAttr.get([kDynamicPtrIndex],
+                                              context=self.ctx))
+                    return cc.LoadOp(elem_addr).result
+            elif quake.VeqType.isinstance(iterable.type):
+                iterableSize = quake.VeqSizeOp(i64Ty, iterable).result
+                iterTy = quake.RefType.get()
+
+                def extractElem(i):
+                    return quake.ExtractRefOp(iterTy, iterable, -1,
+                                              index=i).result
+            else:
+                self.emitFatalError(
+                    "CUDA-Q only supports list comprehension on ranges and "
+                    "arrays", node)
 
         def process_void_list():
             # NOTE: This does not actually create a valid value, and will fail
@@ -4619,64 +4731,107 @@ class PyASTBridge(ast.NodeVisitor):
             return
 
         if quake.RefType.isinstance(listElemTy):
-            if quake.VeqType.isinstance(orig_iterable_type) and not hasFilter:
+            if (not is_range_source and
+                    quake.VeqType.isinstance(orig_iterable_type) and
+                    not hasFilter):
                 self.pushValue(iterable)
                 return
-            if (cc.SequenceType.isinstance(orig_iterable_type) or
+            if (is_range_source or
+                    cc.SequenceType.isinstance(orig_iterable_type) or
                     quake.VeqType.isinstance(orig_iterable_type)):
-                i64Ty = self.getIntegerType()
                 veqTy = self.getVeqType()
                 c0 = self.getConstantInt(0)
                 c1 = self.getConstantInt(1)
-
                 empty_veq_ty = quake.VeqType.get(0, context=self.ctx)
-                init_veq = quake.RelaxSizeOp(
-                    veqTy,
-                    quake.AllocaOp(empty_veq_ty).result).result
+                veq1_ty = quake.VeqType.get(1, context=self.ctx)
 
-                def bodyBuilder(args):
-                    i, curr_veq = args[0], args[1]
-                    if quake.VeqType.isinstance(iterable.type):
-                        idx_val = quake.ExtractRefOp(iterTy,
-                                                     iterable,
-                                                     -1,
-                                                     index=i).result
-                    else:
-                        elem_addr = cc.ComputePtrOp(
-                            cc.PointerType.get(iterTy), iterable, [i],
-                            DenseI32ArrayAttr.get([kDynamicPtrIndex],
-                                                  context=self.ctx))
-                        idx_val = cc.LoadOp(elem_addr).result
+                # Build and record the set of indices described by the list
+                # comprehension itself.
+                idxBufTy = cc.PointerType.get(cc.ArrayType.get(i64Ty))
+                idxBuf = cc.AllocaOp(idxBufTy,
+                                     TypeAttr.get(i64Ty),
+                                     seqSize=iterableSize).result
+
+                def idxBufAddr(k):
+                    return cc.ComputePtrOp(
+                        cc.PointerType.get(i64Ty), idxBuf, [k],
+                        DenseI32ArrayAttr.get([kDynamicPtrIndex],
+                                              context=self.ctx))
+
+                def collectBody(args):
+                    i, count = args[0], args[1]
+                    idx_val = extractElem(i)
                     self.symbolTable.beginBlock()
                     self.__deconstructAssignment(node.generators[0].target,
                                                  idx_val)
-                    if hasFilter:
-                        cond = evalFilter()
-                        ifOp = cc.IfOp([veqTy], cond, [])
-                        thenBlock = Block.create_at_start(ifOp.thenRegion, [])
-                        with InsertionPoint(thenBlock):
-                            self.visit(node.elt)
-                            ref = self.popValue()
-                            appended = quake.ConcatOp(veqTy,
-                                                      [curr_veq, ref]).result
-                            cc.ContinueOp([appended])
-                        elseBlock = Block.create_at_start(ifOp.elseRegion, [])
-                        with InsertionPoint(elseBlock):
-                            cc.ContinueOp([curr_veq])
-                        new_veq = ifOp.result
-                    else:
-                        self.visit(node.elt)
-                        ref = self.popValue()
-                        new_veq = quake.ConcatOp(veqTy, [curr_veq, ref]).result
+                    cond = evalFilter() if hasFilter else None
                     self.symbolTable.endBlock()
-                    cc.ContinueOp([i, new_veq])
+                    if cond is None:
+                        cc.StoreOp(i, idxBufAddr(count))
+                        cc.ContinueOp([i, arith.AddIOp(count, c1).result])
+                        return
+                    ifOp = cc.IfOp([i64Ty], cond, [])
+                    thenBlock = Block.create_at_start(ifOp.thenRegion, [])
+                    with InsertionPoint(thenBlock):
+                        cc.StoreOp(i, idxBufAddr(count))
+                        cc.ContinueOp([arith.AddIOp(count, c1).result])
+                    elseBlock = Block.create_at_start(ifOp.elseRegion, [])
+                    with InsertionPoint(elseBlock):
+                        cc.ContinueOp([count])
+                    cc.ContinueOp([i, ifOp.result])
 
-                loop = self.createForLoop(
-                    [i64Ty, veqTy], bodyBuilder, [c0, init_veq],
+                collect = self.createForLoop(
+                    [i64Ty, i64Ty], collectBody, [c0, c0],
                     lambda args: arith.CmpIOp(IntegerAttr.get(i64Ty, 2), args[
                         0], iterableSize).result,
                     lambda args: [arith.AddIOp(args[0], c1).result, args[1]])
-                self.pushValue(loop.results[1])
+                matchCount = collect.results[1]
+
+                # Construct the `veq` from the list comprehension set. If the
+                # set is empty then the `veq` is poison. This is a bug in the
+                # user's code that neither the bridge nor the compiler will
+                # paper over. Otherwise the set is used to drive a
+                # `quake.concat` chain seeded from the first match.
+                hasMatch = arith.CmpIOp(IntegerAttr.get(i64Ty, 4), matchCount,
+                                        c0).result
+                ifMatchOp = cc.IfOp([veqTy], hasMatch, [])
+                matchThen = Block.create_at_start(ifMatchOp.thenRegion, [])
+                with InsertionPoint(matchThen):
+                    idx0 = cc.LoadOp(idxBufAddr(c0)).result
+                    self.symbolTable.beginBlock()
+                    self.__deconstructAssignment(node.generators[0].target,
+                                                 extractElem(idx0))
+                    self.visit(node.elt)
+                    ref0 = self.popValue()
+                    veq1 = quake.ConcatOp(veq1_ty, [ref0]).result
+                    init_seed = quake.RelaxSizeOp(veqTy, veq1).result
+                    self.symbolTable.endBlock()
+
+                    def buildBody(args):
+                        k, curr_veq = args[0], args[1]
+                        idxK = cc.LoadOp(idxBufAddr(k)).result
+                        self.symbolTable.beginBlock()
+                        self.__deconstructAssignment(node.generators[0].target,
+                                                     extractElem(idxK))
+                        self.visit(node.elt)
+                        ref = self.popValue()
+                        self.symbolTable.endBlock()
+                        grown = quake.ConcatOp(veqTy, [curr_veq, ref]).result
+                        cc.ContinueOp([k, grown])
+
+                    build = self.createForLoop(
+                        [i64Ty, veqTy], buildBody, [c1, init_seed],
+                        lambda args: arith.CmpIOp(IntegerAttr.get(
+                            i64Ty, 2), args[0], matchCount).result, lambda args:
+                        [arith.AddIOp(args[0], c1).result, args[1]])
+                    cc.ContinueOp([build.results[1]])
+                matchElse = Block.create_at_start(ifMatchOp.elseRegion, [])
+                with InsertionPoint(matchElse):
+                    poison = cc.PoisonOp(empty_veq_ty)
+                    cc.ContinueOp(
+                        [quake.RelaxSizeOp(veqTy, poison.result).result])
+
+                self.pushValue(ifMatchOp.result)
                 return
             self.emitFatalError(
                 "unsupported list comprehension producing qubit references",
@@ -4689,15 +4844,6 @@ class PyASTBridge(ast.NodeVisitor):
         listValue = cc.AllocaOp(cc.PointerType.get(listTy),
                                 TypeAttr.get(listElemTy),
                                 seqSize=iterableSize).result
-
-        def extractIterVal(iterVar):
-            if quake.VeqType.isinstance(iterable.type):
-                return quake.ExtractRefOp(iterTy, iterable, -1,
-                                          index=iterVar).result
-            eleAddr = cc.ComputePtrOp(
-                cc.PointerType.get(iterTy), iterable, [iterVar],
-                DenseI32ArrayAttr.get([kDynamicPtrIndex], context=self.ctx))
-            return cc.LoadOp(eleAddr).result
 
         def storeElementAt(storeIdx):
             self.visit(node.elt)
@@ -4716,7 +4862,7 @@ class PyASTBridge(ast.NodeVisitor):
 
             def bodyBuilder(iterVar):
                 self.symbolTable.beginBlock()
-                iterVal = extractIterVal(iterVar)
+                iterVal = extractElem(iterVar)
                 self.__deconstructAssignment(node.generators[0].target, iterVal)
                 storeElementAt(iterVar)
                 self.symbolTable.endBlock()
@@ -4734,7 +4880,7 @@ class PyASTBridge(ast.NodeVisitor):
         def filteredBodyBuilder(args):
             i, count = args[0], args[1]
             self.symbolTable.beginBlock()
-            iterVal = extractIterVal(i)
+            iterVal = extractElem(i)
             self.__deconstructAssignment(node.generators[0].target, iterVal)
             cond = evalFilter()
             ifOp = cc.IfOp([i64Ty], cond, [])
@@ -5211,9 +5357,30 @@ class PyASTBridge(ast.NodeVisitor):
                         "invalid number of arguments to enumerate "
                         "- expecting 1 argument", node)
 
-                self.visit(node.iter.args[0])
-                iterable = self.popValue()
-                getValues = lambda iterVar, v: (iterVar, v)
+                innerIterNode = node.iter.args[0]
+                if (isinstance(innerIterNode, ast.Call) and
+                        isinstance(innerIterNode.func, ast.Name) and
+                        innerIterNode.func.id == 'range'):
+                    # `enumerate(range(...))` never needs a buffer either:
+                    # drive the loop directly off the range bounds (as
+                    # above) and derive `enumerate's` 0-based index from the
+                    # loop variable arithmetically, since `step` is always a
+                    # compile-time constant. FIXME: handle `start` argument.
+                    iterable = None
+                    startVal, endVal, stepVal, isDecrementing = \
+                        self.__processRangeLoopIterationBounds(
+                            innerIterNode.args)
+                    rangeStart, rangeStep = startVal, stepVal
+
+                    def getValues(iterVar):
+                        idx = arith.DivSIOp(
+                            arith.SubIOp(iterVar, rangeStart).result,
+                            rangeStep).result
+                        return (idx, iterVar)
+                else:
+                    self.visit(innerIterNode)
+                    iterable = self.popValue()
+                    getValues = lambda iterVar, v: (iterVar, v)
 
         if not getValues:
             self.visit(node.iter)
@@ -5272,6 +5439,8 @@ class PyASTBridge(ast.NodeVisitor):
             else:
                 self.emitFatalError('{} iterable type not supported.', node)
 
+        loopLocal = self.loopLocalTargets.get(id(node), set())
+
         def blockBuilder(iterVar, stmts):
             self.symbolTable.beginBlock()
             values = getValues(iterVar)
@@ -5279,8 +5448,15 @@ class PyASTBridge(ast.NodeVisitor):
             # iteration variable(s) to have consistent behavior.
             assignNode = ast.Assign(targets=[node.target], value=values)
             assignNode.lineno = node.lineno
-            self.visit(assignNode)
-            [self.visit(b) for b in stmts]
+            outerSink = self.sinkAllocaNames
+            self.sinkAllocaNames = {
+                name for name in loopLocal if name not in self.symbolTable
+            }
+            try:
+                self.visit(assignNode)
+            finally:
+                self.sinkAllocaNames = outerSink
+            self.buildScopedBlock(stmts)
             self.symbolTable.endBlock()
 
         self.createMonotonicForLoop(
@@ -5309,12 +5485,12 @@ class PyASTBridge(ast.NodeVisitor):
 
         def blockBuilder(iterVar):
             self.symbolTable.beginBlock()
-            [self.visit(b) for b in node.body]
+            self.buildScopedBlock(node.body)
             self.symbolTable.endBlock()
 
         self.createForLoop([], blockBuilder, [], evalCond, lambda _: [],
                            None if not node.orelse else
-                           lambda _: [self.visit(stmt) for stmt in node.orelse])
+                           lambda _: self.buildScopedBlock(node.orelse))
 
     def visit_BoolOp(self, node):
         """Convert boolean operations into equivalent MLIR operations using the
@@ -5574,24 +5750,20 @@ class PyASTBridge(ast.NodeVisitor):
         ifOp = cc.IfOp([], condition, [])
         thenBlock = Block.create_at_start(ifOp.thenRegion, [])
         with InsertionPoint(thenBlock):
-            self.symbolTable.beginBlock()
             self.pushIfStmtBlockStack()
-            [self.visit(b) for b in node.body]
+            self.buildScopedBlock(node.body)
             if not self.hasTerminator(thenBlock):
                 cc.ContinueOp([])
             self.popIfStmtBlockStack()
-            self.symbolTable.endBlock()
 
         if len(node.orelse) > 0:
             elseBlock = Block.create_at_start(ifOp.elseRegion, [])
             with InsertionPoint(elseBlock):
-                self.symbolTable.beginBlock()
                 self.pushIfStmtBlockStack()
-                [self.visit(b) for b in node.orelse]
+                self.buildScopedBlock(node.orelse)
                 if not self.hasTerminator(elseBlock):
                     cc.ContinueOp([])
                 self.popIfStmtBlockStack()
-                self.symbolTable.endBlock()
 
     def visit_Return(self, node):
 
@@ -6164,9 +6336,8 @@ def compile_to_mlir(uniqueId, astModule, signature: KernelSignature, defFrame,
     """
 
     verbose = 'verbose' in kwargs and kwargs['verbose']
-    # `location` may be absent, explicitly None (e.g. a kernel reconstructed via
-    # `from_json` whose serialized location was null), or empty; in every such
-    # case fall back to the default offset so diagnostics never subscript a
+    # `location` may be absent, explicitly None, or empty; in every such case
+    # fall back to the default offset so diagnostics never subscript a
     # non-`(filename, lineno)` value.
     lineNumberOffset = kwargs.get('location') or ('', 0)
     kernelModuleName = kwargs[
@@ -6174,6 +6345,7 @@ def compile_to_mlir(uniqueId, astModule, signature: KernelSignature, defFrame,
     cudaqAliases = kwargs.get('cudaqAliases', None)
     disable_quantum_optimization = kwargs.get('disable_quantum_optimization',
                                               False)
+    atomic_quantum_region = kwargs.get('atomic_quantum_region', False)
 
     # Build the AOT Quake Module for this kernel. Wrapped in a single span so
     # the tracer can separate Python-AST-to-MLIR construction from the AOT
@@ -6194,10 +6366,13 @@ def compile_to_mlir(uniqueId, astModule, signature: KernelSignature, defFrame,
         with trace.span("ast_bridge.validate_return_statements"):
             ValidateReturnStatements(bridge).visit(astModule)
         bridge.visit(astModule)
+        if atomic_quantum_region:
+            bridge.kernelFuncOp.attributes.__setitem__(
+                'atomic_quantum_region', UnitAttr.get(context=bridge.ctx))
 
     # Precompile (simplify) the Module. Run via `cudaq_runtime.runPassManager`
     # so `TracePassInstrumentation` is installed (matching the JIT-side
-    # install at `runtime/internal/compiler/RuntimePyMLIR.cpp`). Without this,
+    # install at `runtime/internal/compiler/RuntimeMLIR.cpp`). Without this,
     # AOT passes execute through upstream MLIR's `pm.run()` without a tracer
     # attached and per-pass wall-time cannot be attributed.
     #
@@ -6209,8 +6384,9 @@ def compile_to_mlir(uniqueId, astModule, signature: KernelSignature, defFrame,
     try:
         with trace.span("cudaq.pipeline.aot"):
             cudaq_runtime.runPassManager(pm, bridge.module)
-    except:
-        raise RuntimeError(f"could not compile code for '{bridge.name}'.")
+    except Exception as e:
+        raise RuntimeError(
+            f"could not compile code for '{bridge.name}'.\n{e}") from e
 
     bridge.module.operation.attributes.__setitem__(
         cudaq__unique_attr_name, StringAttr.get(bridge.name,

@@ -171,7 +171,7 @@ static constexpr IntrinsicCode intrinsicTable[] = {
     %1 = arith.constant 1 : i64
     %n1 = arith.constant -1 : i64
     %c1 = arith.cmpi eq, %step, %0 : i64
-    cf.cond_br %c1, ^b1, ^exit(%0 : i64)
+    cf.cond_br %c1, ^exit(%0 : i64), ^b1
    ^b1:
     %c2 = arith.cmpi sgt, %step, %0 : i64
     %adjust = arith.select %c2, %1, %n1 : i64
@@ -576,11 +576,8 @@ static constexpr IntrinsicCode intrinsicTable[] = {
     // This helper function copies a buffer off the stack to the heap. This is
     // required when the data on the stack is about to go out of scope but is
     // still live.
-    // Keep this function no_inline until RunSemanticsHackery removes the copy
-    // from generated `.run` clones; otherwise malloc/memcpy reaches remote
-    // targets.
     {"__nvqpp_vectorCopyCtor", {cudaq::llvmMemCopyIntrinsic, "malloc"}, R"#(
-  func.func private @__nvqpp_vectorCopyCtor(%arg0: !cc.ptr<i8>, %arg1: i64, %arg2: i64) -> !cc.ptr<i8> attributes {no_inline} {
+  func.func private @__nvqpp_vectorCopyCtor(%arg0: !cc.ptr<i8>, %arg1: i64, %arg2: i64) -> !cc.ptr<i8> {
     %size = arith.muli %arg1, %arg2 : i64
     %0 = call @malloc(%size) : (i64) -> !cc.ptr<i8>
     %false = arith.constant false

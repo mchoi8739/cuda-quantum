@@ -24,6 +24,7 @@ add_cudaq_library(OptTransforms
   CombineMeasurements.cpp
   CombineQuantumAlloc.cpp
   CommutationAwareRewrite.cpp
+  ConsolidateBroadcasts.cpp
   ConstantPropagation.cpp
   DeadQuantumElimination.cpp
   DeadStoreRemoval.cpp
@@ -36,6 +37,7 @@ add_cudaq_library(OptTransforms
   EraseNopCalls.cpp
   EraseQEC.cpp
   EraseVectorCopyCtor.cpp
+  ExpandBroadcasts.cpp
   ExpandControlNegations.cpp
   ExpandControlVeqs.cpp
   ExpandMeasurements.cpp
@@ -84,9 +86,9 @@ add_cudaq_library(OptTransforms
   StackFramePrealloc.cpp
   StatePreparation.cpp
   UnitarySynthesis.cpp
+  UnwindByDataFlow.cpp
   UpdateRegisterNames.cpp
   VariableCoalesce.cpp
-  VerifyNoPhase.cpp
   WiresToWiresets.cpp
   WriteAfterWriteElimination.cpp
 
@@ -113,9 +115,7 @@ target_include_directories(OptTransforms SYSTEM
 
 check_registered_mlir_lib(OptTransforms)
 
-target_link_libraries(OptTransforms PRIVATE cudaq-synth)
-target_include_directories(obj.OptTransforms SYSTEM PRIVATE
-  $<TARGET_PROPERTY:cudaq-synth,INTERFACE_INCLUDE_DIRECTORIES>)
+cudaq_target_link_libraries(OptTransforms PRIVATE cudaq-synth)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set_source_files_properties(CliffordTSynthesis.cpp PROPERTIES
     COMPILE_OPTIONS "-Wno-maybe-uninitialized")
