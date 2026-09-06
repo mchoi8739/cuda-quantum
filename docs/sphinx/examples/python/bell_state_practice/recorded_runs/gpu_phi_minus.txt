@@ -1,0 +1,16 @@
+Command: python bell_phase.py --phase-flip
+UTC: 2026-09-06T01:46:12.007303+00:00
+
+CUDA-Q 0.15.1 | target=nvidia
+Phase flip: True
+     ╭───╮     ╭───╮
+q0 : ┤ h ├──●──┤ z ├
+     ╰───╯╭─┴─╮╰───╯
+q1 : ─────┤ x ├─────
+          ╰───╯
+
+Statevector: [ 0.707107+0.j  0.      +0.j  0.      +0.j -0.707107+0.j]
+Z-basis counts (1000 shots): { 00:482 11:518 }
+
+<X0 X1>: -0.9999999403953552
+<Z0 Z1>: 0.9999999403953552

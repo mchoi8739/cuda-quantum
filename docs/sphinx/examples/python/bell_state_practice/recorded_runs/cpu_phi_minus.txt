@@ -1,0 +1,16 @@
+Command: python bell_phase.py --target qpp-cpu --phase-flip
+UTC: 2026-09-06T01:46:13.258067+00:00
+
+CUDA-Q 0.15.1 | target=qpp-cpu
+Phase flip: True
+     ╭───╮     ╭───╮
+q0 : ┤ h ├──●──┤ z ├
+     ╰───╯╭─┴─╮╰───╯
+q1 : ─────┤ x ├─────
+          ╰───╯
+
+Statevector: [ 0.707107+0.j  0.      +0.j  0.      +0.j -0.707107+0.j]
+Z-basis counts (1000 shots): { 00:491 11:509 }
+
+<X0 X1>: -0.9999999999999996
+<Z0 Z1>: 0.9999999999999998

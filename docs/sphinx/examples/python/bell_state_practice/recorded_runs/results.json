@@ -1,0 +1,148 @@
+{
+  "python": "3.12.3",
+  "versions": {
+    "cudaq": "0.15.1",
+    "numpy": "2.5.2"
+  },
+  "source_file": "bell_phase.py",
+  "source_sha256": "1a95c23f72767bbf4b75266fa114aee27bf33dee1ed59b5a9e2dc66a6b73f90b",
+  "numeric_tolerance": 2e-06,
+  "runs": [
+    {
+      "name": "gpu_phi_plus",
+      "command": "python bell_phase.py",
+      "started_utc": "2026-09-06T01:46:11.062012+00:00",
+      "target": "nvidia",
+      "phase_flip": false,
+      "shots": 1000,
+      "counts": {
+        "00": 492,
+        "11": 508
+      },
+      "statevector_printed": [
+        [
+          0.707107,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.707107,
+          0.0
+        ]
+      ],
+      "xx_expectation": 0.9999999403953552,
+      "zz_expectation": 0.9999999403953552,
+      "exit_status": 0,
+      "validation_passed": true
+    },
+    {
+      "name": "gpu_phi_minus",
+      "command": "python bell_phase.py --phase-flip",
+      "started_utc": "2026-09-06T01:46:12.007303+00:00",
+      "target": "nvidia",
+      "phase_flip": true,
+      "shots": 1000,
+      "counts": {
+        "00": 482,
+        "11": 518
+      },
+      "statevector_printed": [
+        [
+          0.707107,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          -0.707107,
+          0.0
+        ]
+      ],
+      "xx_expectation": -0.9999999403953552,
+      "zz_expectation": 0.9999999403953552,
+      "exit_status": 0,
+      "validation_passed": true
+    },
+    {
+      "name": "cpu_phi_plus",
+      "command": "python bell_phase.py --target qpp-cpu",
+      "started_utc": "2026-09-06T01:46:12.742759+00:00",
+      "target": "qpp-cpu",
+      "phase_flip": false,
+      "shots": 1000,
+      "counts": {
+        "00": 495,
+        "11": 505
+      },
+      "statevector_printed": [
+        [
+          0.707107,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.707107,
+          0.0
+        ]
+      ],
+      "xx_expectation": 0.9999999999999996,
+      "zz_expectation": 0.9999999999999998,
+      "exit_status": 0,
+      "validation_passed": true
+    },
+    {
+      "name": "cpu_phi_minus",
+      "command": "python bell_phase.py --target qpp-cpu --phase-flip",
+      "started_utc": "2026-09-06T01:46:13.258067+00:00",
+      "target": "qpp-cpu",
+      "phase_flip": true,
+      "shots": 1000,
+      "counts": {
+        "00": 491,
+        "11": 509
+      },
+      "statevector_printed": [
+        [
+          0.707107,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          -0.707107,
+          0.0
+        ]
+      ],
+      "xx_expectation": -0.9999999999999996,
+      "zz_expectation": 0.9999999999999998,
+      "exit_status": 0,
+      "validation_passed": true
+    }
+  ]
+}
