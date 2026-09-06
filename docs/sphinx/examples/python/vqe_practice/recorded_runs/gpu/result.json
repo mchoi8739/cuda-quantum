@@ -1,0 +1,36 @@
+{
+  "started_utc": "2026-09-06T00:59:05.395044+00:00",
+  "target": "nvidia",
+  "versions": {
+    "cudaq": "0.15.1",
+    "numpy": "2.5.2",
+    "scipy": "1.18.1",
+    "matplotlib": "3.11.1"
+  },
+  "optimizer": "scipy.optimize.minimize / COBYLA",
+  "options": {
+    "rhobeg": 0.5,
+    "tol": 0.0001,
+    "maxiter": 100
+  },
+  "initial_angle_radians": 0.0,
+  "initial_energy_mev": -0.4362899999999996,
+  "optimized_angle_radians": 0.5942035533905933,
+  "optimized_energy_mev": -1.7488648556109525,
+  "optimizer_success": true,
+  "optimizer_message": "Return from COBYLA because the trust region radius reaches its lower bound.",
+  "optimizer_evaluations": 22,
+  "exact_ground_energy_mev": -1.7488649141752755,
+  "absolute_energy_error_mev": 5.85643229467081e-08,
+  "ground_state_fidelity": 0.9999999986165944,
+  "reference_ground_state_weight_in_ansatz_sector": 0.9999999999999999,
+  "landscape_evaluations": 65,
+  "max_landscape_matrix_error_mev": 1.1369357491020082e-06,
+  "landscape_varies": true,
+  "energy_tolerance_mev": 2e-05,
+  "validation_passed": true,
+  "source_sha256": {
+    "energy.py": "d3a4b20d60108a8d54c6b1af977d44cb0bc85703d3427bd2880076d5630882db",
+    "vqe.py": "8ca3b5847a7cda48da1f0c85b083345905ae09652c186ecd5e7d02cda1a789df"
+  }
+}

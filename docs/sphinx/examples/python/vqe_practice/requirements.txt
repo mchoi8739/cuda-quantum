@@ -1,0 +1,5 @@
+# Validated with Python 3.12 on Ubuntu 24.04.
+cudaq==0.15.1
+numpy==2.5.2
+scipy==1.18.1
+matplotlib==3.11.1
